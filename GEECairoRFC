@@ -1,0 +1,294 @@
+// //=====================================================================================================================
+// //                                        NASA - University of Maryland (ESSIC)
+// // Random Forest Classification for Cairo
+// //                                                  
+// // Code: Random Forest Classification Tutorial for Cairo
+// // Written by: Abigail Barenblitt NASA Goddard and University of Maryland, abigail.barenblitt@nasa.gov, @abarenblitt 
+// //            Dr. Celio de Sousa NASA Goddard and USRA, celio.h.resendedesousa@nasa.gov
+// // Objective: This code works through a tutorial for a random forest classification of Cairo
+//     Date: 09/24/2020
+//     Version: 1.0
+//     Copyright 2020 Abigail Barenblitt and Celio de Sousa
+//     Permission is hereby granted, free of charge, to any person obtaining a copy
+//     of this software and associated documentation files (the "Software"), to deal
+//     in the Software without restriction, including without limitation the rights
+//     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//     copies of the Software, and to permit persons to whom the Software is
+//     furnished to do so, subject to the following conditions:
+//     The above copyright notice and this permission notice shall be included in all
+//     copies or substantial portions of the Software.
+//     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//     SOFTWARE.'''
+
+//look at my code here: https://bitbucket.org/nathanmthomas/bucket-of-rs-and-gis-scripts/src/master/SearchPullGEDI.py
+
+// //=====================================================================================================================
+
+
+// ///////////////////////////////////////////////////////////////
+// //                    1) Center Map                          //
+// ///////////////////////////////////////////////////////////////
+
+
+// //Center map to region of interest
+Map.setCenter(31.2149, 30.0863,8)
+
+// ///////////////////////////////////////////////////////////////
+// //                    2) Assemble Landsat Imagery            //
+// ///////////////////////////////////////////////////////////////
+
+
+// //2.1) Define temporal parameters of interest
+// //////////////////////////////////////////////
+
+var year = 2018; // Year
+var startDay = (year)+'-01-01'; // beginning of date filter | month-day
+var endDay = (year)+'-12-30'; // end of date filter | month-day
+
+// //2.2) Define region of interest
+// ////////////////////////////////
+
+var aoi = AreaOfInterest;
+
+// //2.3) Mask out clouds and cloud shadows
+// /////////////////////////////////////////
+
+var maskL8sr = function (image) {
+// Bits 3 and 5 are cloud shadow and cloud, respectively.
+var cloudShadowBitMask = 1 << 3;
+var cloudsBitMask = 1 << 5;
+// Get the pixel QA band.
+var qa = image.select('pixel_qa');
+// Both flags should be set to zero, indicating clear conditions.
+var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+.and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+// Return the masked image, scaled to reflectance, without the QA bands.
+return image.updateMask(mask).divide(10000)
+.select("B[0-9]*")
+.copyProperties(image, ["system:time_start"]);
+};
+
+// //2.4)Add Spectral Indices for Random Forest Classifier
+// ////////////////////////////////////////////////////////
+
+var addIndicesL8 = function(img) {
+// NDVI (Normalized Difference Vegetation Index)
+var ndvi = img.normalizedDifference(['B5','B4']).rename('NDVI');
+// NDMI (Normalized Difference Mangrove Index - Shi et al 2016 )
+var ndmi = img.normalizedDifference(['B7','B3']).rename('NDMI');
+// MNDWI (Modified Normalized Difference Water Index - Hanqiu Xu, 2006)
+var mndwi = img.normalizedDifference(['B3','B6']).rename('MNDWI');
+// SR (Simple Ratio)
+var sr = img.select('B5').divide(img.select('B4')).rename('SR');
+// Band Ratio 6/5
+var ratio65 = img.select('B6').divide(img.select('B5')).rename('R65');
+// Band Ratio 4/6
+var ratio46 = img.select('B4').divide(img.select('B6')).rename('R46');
+// GCVI (Green Chlorophyll Vegetation Index)
+var gcvi = img.expression('(NIR/GREEN)-1',{
+'NIR':img.select('B5'),
+'GREEN':img.select('B3')
+}).rename('GCVI');
+var ndvi2 = img.normalizedDifference(['B5','B4']).rename('NDVI2')
+
+return img
+.addBands(ndvi) // This will add each spectral index to each Landsat scene
+.addBands(ndmi)
+.addBands(mndwi)
+.addBands(sr)
+.addBands(ratio65)
+.addBands(ratio46)
+.addBands(gcvi)
+.addBands(ndvi2)
+};
+
+// //2.5) Import collection for Landsat Imagery
+// /////////////////////////////////////////////
+
+var collection = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+.filterDate(startDay, endDay) 
+.map(maskL8sr) // Masks for clouds and cloud-shadows
+.map(addIndicesL8); // Add the indices
+
+// //2.6) Composite Landsat Data
+// ////////////////////////////////
+
+var composite = collection
+.median() // Uses the median reducer
+.clip(aoi); // Clips the composite to our area of interest
+
+// ///////////////////////////////////////////////////////////////
+// //                    3) Display Results So Far              //
+// ///////////////////////////////////////////////////////////////
+
+
+// //3.1) Center Map
+// //////////////////
+
+Map.centerObject(aoi,8); // Set the map center to match the location of aoi
+
+// //3.2)Add Layer to Map
+// ///////////////////////
+
+// //True Color
+
+Map.addLayer(composite, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, 'Composite');
+
+// //False Color
+Map.addLayer(composite, {bands: ['B5', 'B4', 'B3'], min: 0, max: 0.3}, 'False Color Composite');
+
+// ///////////////////////////////////////////////////////////////
+// //                    4) Create Training Data                //
+// ///////////////////////////////////////////////////////////////
+
+// //4.1) Merge class sample
+// ////////////////////////////
+
+var classes = Water.merge(Cropland)
+.merge(Sand)
+.merge(Urban);
+
+// //4.2) Select bands used for training the model
+// ///////////////////////////////////////////////
+
+var bands = ['B6','B7','NDVI','MNDWI','SR','GCVI']
+
+// //4.3) Sample Landsat pixels using the geometries we created
+// /////////////////////////////////////////////////////////////
+
+var samples = composite.select(bands).sampleRegions({
+collection: classes, // Set of geometries selected in 4.1
+properties: ['landcover'], // Label from each geometry
+scale: 30 // Make each sample the same size as Landsat pixel
+}).randomColumn('random'); // creates a column with random numbers
+
+// //4.4) Subset some data points for later accuracy assessment
+// /////////////////////////////////////////////////////////////
+
+var split = 0.8; // Roughly 80% for training, 20% for testing.
+var training = samples.filter(ee.Filter.lt('random', split));
+var testing = samples.filter(ee.Filter.gte('random', split));
+
+
+// //4.5) Inspect size of samples, training, and testing objects
+// /////////////////////////////////////////////////////////////
+
+print('Samples n =', samples.aggregate_count('.all'));
+print('Training n =', training.aggregate_count('.all'));
+print('Testing n =', testing.aggregate_count('.all'));
+
+// ///////////////////////////////////////////////////////////////
+// //                    5) Train Classifier                   //
+// ///////////////////////////////////////////////////////////////
+
+
+// //5.1) Now train the classifier
+// //////////////////////////////////
+
+var classifier = ee.Classifier.smileRandomForest(100,5).train({
+features: training.select(['B6','B7','NDVI','MNDWI','SR','GCVI', 'landcover']),
+classProperty: 'landcover',
+inputProperties: bands
+});
+
+// //5.2) Assess accuracy of model original fit
+// /////////////////////////////////////////////
+
+var validation = testing.classify(classifier);
+var testAccuracy = validation.errorMatrix('landcover', 'classification');
+print('Validation error matrix RF: ', testAccuracy);
+print('Validation overall accuracy RF: ', testAccuracy.accuracy());
+
+// //5.3) Classify the Landsat Composite
+// //////////////////////////////////////
+
+var classifiedrf = composite.select(bands) // select the predictors
+.classify(classifier); // apply the Random Forest
+
+print(classifier.explain())
+
+// ///////////////////////////////////////////////////////////////
+// //                    6) Display Results                     //
+// ///////////////////////////////////////////////////////////////
+
+
+// //6.1) Create colors for legend
+// ///////////////////////////////
+
+var paletteMAP = [
+'#0040ff', // Water (Class value 0)
+'#00ab0c', // Croplands / Cultivated Areas (Class value 1)
+'#fbf2ad', // Sand and bare areas (Class value 2)
+'#878587', // Built-up and Urban Areas (Class value 3)
+];
+
+// //6.2) Create panel for legend
+// ///////////////////////////////
+
+var legend = ui.Panel({
+style: {
+position: 'bottom-left', // Position in the map
+padding: '8px 15px' // Padding (border) size
+}
+});
+
+// //6.3) Create rows for legend items
+// ///////////////////////////////////
+
+var makeRow = function(color, name) {
+// Create the label that is actually the colored boxes that represent each class
+var colorBox = ui.Label({
+style: {
+backgroundColor: '#' + color,
+// Use padding to give the label color box height and width.
+padding: '8px',
+margin: '0 0 4px 0'
+}
+});
+
+// //6.4) Create the label filled with the description text.
+// /////////////////////////////////////////////////////////
+
+var description = ui.Label({
+value: name,
+style: {margin: '0 0 4px 6px'}
+});
+return ui.Panel({
+widgets: [colorBox, description],
+layout: ui.Panel.Layout.Flow('horizontal')
+});
+};
+
+// //6.5) Add rows to legend
+// ///////////////////////////
+
+legend.add(makeRow('0040ff', 'Water'));
+legend.add(makeRow('00ab0c', 'Croplands / Cultivated areas'));
+legend.add(makeRow('fbf2ad', 'Sand and bare areas'));
+legend.add(makeRow('878587', 'Artificial Surfaces'));
+
+// //6.6) Display the classification results.
+Map.addLayer (classifiedrf, {min: 0, max: 3, palette:paletteMAP}, 'Classification');
+Map.add(legend);
+
+// ///////////////////////////////////////////////////////////////
+// //                    7) Export Results                      //
+// ///////////////////////////////////////////////////////////////
+
+
+// //Export results
+Export.image.toAsset({
+image: classifiedrf, // Image you want to export
+description: 'ClassificationOutput', // Name showing on the task list (no space)
+assetId: 'Cairo2019', // Asset name (No spaces allowed)
+scale: 30, // Scale (30m Landsat)
+region: AreaOfInterest, // Region
+maxPixels:1e13 // Default: if the export exceeds 1e8 = error!
+});
+
+// //** End Tutorial**//
